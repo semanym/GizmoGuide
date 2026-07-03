@@ -7,6 +7,9 @@ from app.schemas.user_profile import UserProfile
 from app.tracing import trace_span
 
 REPAIR_SCORE = {"low": 10.0, "medium": 7.0, "high": 4.0}
+# 预算维度中性分：预算未知、或该机型 ZOL 缺价（price<=0）时使用。
+# 缺价不能当成「0 元完美匹配预算」拿满分，只能中性处理，既不奖励也不误伤。
+NEUTRAL_PRICE_SCORE = 7.0
 
 
 def recommend(products: list[ProductSpec], profile: UserProfile) -> RecommendationResult:
@@ -77,8 +80,11 @@ def _score_product(product: ProductSpec, profile: UserProfile, weights: dict[str
 
 
 def _price_score(product: ProductSpec, profile: UserProfile) -> float:
+    # 缺价（ZOL 无电商报价，price<=0）不参与预算匹配，给中性分，避免 0 元被当成完美匹配。
+    if product.price <= 0:
+        return NEUTRAL_PRICE_SCORE
     if profile.budget is None:
-        return 7.0
+        return NEUTRAL_PRICE_SCORE
     if product.price <= profile.budget:
         saving_ratio = (profile.budget - product.price) / max(profile.budget, 1)
         return min(10.0, 8.0 + saving_ratio * 2)
@@ -179,7 +185,7 @@ def _build_risks(scores: list[ProductScore], profile: UserProfile) -> list[str]:
         if score.dimension_scores.get("repair", 10) <= 5:
             risks.append(f"{score.product_name}：维修成本或维修风险偏高。")
     if not risks:
-        risks.append("当前只基于 mock 参数和规则判断，尚未接入真实价格、维修和评测证据。")
+        risks.append("当前只基于 ZOL 原始参数和规则打分，尚未接入真实价格、维修和评测证据。")
     return risks[:5]
 
 

@@ -2,15 +2,20 @@ const compareForm = document.querySelector("#compare-form");
 const chatForm = document.querySelector("#chat-form");
 const productA = document.querySelector("#product-a");
 const productB = document.querySelector("#product-b");
+const productAResults = document.querySelector("#product-a-results");
+const productBResults = document.querySelector("#product-b-results");
 const userMessage = document.querySelector("#user-message");
 const submitButton = document.querySelector("#submit-button");
 const chatStream = document.querySelector("#chat-stream");
 const welcomeState = document.querySelector("#welcome-state");
 
-let productOptions = [];
+const pickers = new Map();
 let activeCandidates = [];
 let hasCompared = false;
 let sessionId = `session-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+
+setupPicker(productA, productAResults);
+setupPicker(productB, productBResults);
 
 for (const button of document.querySelectorAll(".preset")) {
   button.addEventListener("click", () => {
@@ -32,50 +37,140 @@ chatForm.addEventListener("submit", async (event) => {
 userMessage.addEventListener("input", autosizeTextarea);
 
 async function loadProducts() {
+  await selectProduct(productA, "iPhone 15");
+  await selectProduct(productB, "vivo X100");
+}
+
+function setupPicker(input, resultsNode) {
+  const priceNode = document.createElement("div");
+  priceNode.className = "picker-price";
+  input.closest(".search-picker")?.appendChild(priceNode);
+
+  const state = {
+    input,
+    resultsNode,
+    priceNode,
+    selected: null,
+    searchTimer: null,
+    requestSeq: 0,
+  };
+  pickers.set(input, state);
+
+  input.addEventListener("input", () => {
+    state.selected = null;
+    setPickerPrice(state, "");
+    clearTimeout(state.searchTimer);
+    state.searchTimer = setTimeout(() => searchProducts(state, input.value.trim()), 220);
+  });
+  input.addEventListener("focus", () => {
+    if (!state.selected && input.value.trim()) searchProducts(state, input.value.trim());
+  });
+}
+
+document.addEventListener("click", (event) => {
+  for (const state of pickers.values()) {
+    if (!state.input.contains(event.target) && !state.resultsNode.contains(event.target)) {
+      hideResults(state);
+    }
+  }
+});
+
+async function searchProducts(state, query) {
+  if (!query) {
+    hideResults(state);
+    return;
+  }
+  const seq = ++state.requestSeq;
   try {
-    const response = await fetch("/products");
+    const response = await fetch(`/products?q=${encodeURIComponent(query)}&limit=8`);
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
-    productOptions = await response.json();
-    renderProductSelect(productA, "iphone_15");
-    renderProductSelect(productB, "vivo_x100");
+    const data = await response.json();
+    if (seq !== state.requestSeq) return;
+    renderSearchResults(state, data.items || []);
   } catch (error) {
-    appendErrorMessage(new Error("商品列表加载失败，请检查后端服务。"));
-    console.warn("Failed to load products", error);
+    renderSearchError(state, error);
   }
 }
 
-function renderProductSelect(select, selectedId) {
-  select.innerHTML = productOptions
-    .map((product) => {
-      const selected = product.id === selectedId ? " selected" : "";
-      const label = `${product.name} · ¥${product.price}`;
-      return `<option value="${escapeHtml(product.id)}"${selected}>${escapeHtml(label)}</option>`;
-    })
-    .join("");
+function renderSearchResults(state, items) {
+  if (!items.length) {
+    state.resultsNode.innerHTML = `<div class="search-empty">没有找到匹配机型</div>`;
+    state.resultsNode.classList.remove("hidden");
+    return;
+  }
+  state.resultsNode.innerHTML = items.map((item) => renderSearchItem(item)).join("");
+  for (const option of state.resultsNode.querySelectorAll(".search-option")) {
+    // 用 mousedown + preventDefault：避免点击 option 时 <label> 把焦点重新丢回 input，
+    // 触发 focus 里的二次搜索导致下拉「回弹」。
+    option.addEventListener("mousedown", (event) => {
+      event.preventDefault();
+      const item = items.find((candidate) => candidate.id === option.dataset.id);
+      if (item) chooseProduct(state, item);
+    });
+  }
+  state.resultsNode.classList.remove("hidden");
 }
 
-function selectProduct(select, nameOrId) {
-  const normalized = normalize(nameOrId);
-  const product = productOptions.find((item) => {
-    const aliases = [item.id, item.name, ...(item.aliases || [])];
-    return aliases.some((alias) => normalize(alias) === normalized);
-  });
-  if (product) select.value = product.id;
+function renderSearchItem(item) {
+  const price = getProductPrice(item);
+  const meta = buildProductMetaLine(item, { skipPrice: true });
+  return `
+    <button type="button" class="search-option" data-id="${escapeHtml(item.id)}">
+      <div class="search-option-head">
+        <strong>${escapeHtml(item.name)}</strong>
+        ${price ? `<b class="search-price">${escapeHtml(price)}</b>` : ""}
+      </div>
+      <span>${escapeHtml(meta || "ZOL 参数库")}</span>
+    </button>
+  `;
+}
+
+function renderSearchError(state, error) {
+  state.resultsNode.innerHTML = `<div class="search-empty">${escapeHtml(error.message || "搜索失败")}</div>`;
+  state.resultsNode.classList.remove("hidden");
+}
+
+function chooseProduct(state, item) {
+  state.selected = item;
+  state.input.value = item.name;
+  setPickerPrice(state, getProductPrice(item));
+  hideResults(state);
+}
+
+function setPickerPrice(state, price) {
+  if (!state.priceNode) return;
+  // 价格行始终占位（见 .picker-price 固定高度），只切换文字，避免选中后布局高度变化
+  // 导致页面回弹、两列不对齐。
+  state.priceNode.textContent = price ? `参考价 ${price}` : "";
+}
+
+function hideResults(state) {
+  state.resultsNode.classList.add("hidden");
+}
+
+async function selectProduct(input, nameOrId) {
+  const state = pickers.get(input);
+  if (!state) return;
+  const response = await fetch(`/products?q=${encodeURIComponent(nameOrId)}&limit=1`);
+  if (!response.ok) return;
+  const data = await response.json();
+  const item = (data.items || [])[0];
+  if (item) chooseProduct(state, item);
 }
 
 function startComparison() {
-  const left = getProduct(productA.value);
-  const right = getProduct(productB.value);
+  const left = getSelectedProduct(productA);
+  const right = getSelectedProduct(productB);
   if (!left || !right) {
     appendErrorMessage(new Error("请选择两款候选商品。"));
     return;
   }
-  if (left.id === right.id) {
+  if (left.name === right.name) {
     appendErrorMessage(new Error("请选择两款不同的候选商品。"));
     return;
   }
 
-  activeCandidates = [left.id, right.id];
+  activeCandidates = [left.name, right.name];
   hasCompared = true;
   sessionId = `session-${Date.now()}-${Math.random().toString(16).slice(2)}`;
   welcomeState.classList.add("hidden");
@@ -202,7 +297,6 @@ function renderComparison(left, right) {
     <header class="compare-head">
       <div>
         <h2>${escapeHtml(left.name)} vs ${escapeHtml(right.name)}</h2>
-        <p>这是基于当前 mock 商品库的基础参数对比，还没有接入实时价格、评测和维修证据。</p>
       </div>
     </header>
     <div class="compare-grid">
@@ -214,39 +308,29 @@ function renderComparison(left, right) {
 }
 
 function renderCompareProduct(product) {
+  const facts = buildProductPreview(product, 6);
   return `
     <article class="compare-product">
       <h3>${escapeHtml(product.name)}</h3>
-      <div class="compare-meta">${escapeHtml(product.brand)} · ${product.os.toUpperCase()} · ¥${product.price}</div>
+      <div class="compare-meta">${escapeHtml(buildProductMetaLine(product) || "ZOL 参数库")}</div>
       <div class="compare-facts">
-        ${renderCompareFact("性能", `${product.chip_tier}/10`)}
-        ${renderCompareFact("拍照", `${product.camera_tier}/10`)}
-        ${renderCompareFact("续航", `${product.battery_tier}/10`)}
-        ${renderCompareFact("屏幕", `${product.screen_tier}/10`)}
-        ${renderCompareFact("存储", `${product.storage_gb}GB`)}
-        ${renderCompareFact("重量", `${product.weight_g}g`)}
-        ${renderCompareFact("维修风险", repairRiskLabel(product.repair_risk))}
+        ${facts.length ? facts.map((fact) => renderCompareFact(fact.label, fact.value)).join("") : renderCompareFact("数据", "已加载原始记录")}
       </div>
     </article>
   `;
 }
 
 function renderCompareFact(label, value) {
-  return `<div class="compare-fact"><span>${label}</span><strong>${value}</strong></div>`;
+  return `<div class="compare-fact"><span>${escapeHtml(label)}</span><strong>${escapeHtml(value)}</strong></div>`;
 }
 
 function buildCompareSummary(left, right) {
-  const parts = [];
-  const cheaper = left.price === right.price ? null : left.price < right.price ? left : right;
-  const camera = left.camera_tier === right.camera_tier ? null : left.camera_tier > right.camera_tier ? left : right;
-  const battery = left.battery_tier === right.battery_tier ? null : left.battery_tier > right.battery_tier ? left : right;
-  const lighter = left.weight_g === right.weight_g ? null : left.weight_g < right.weight_g ? left : right;
-
-  if (cheaper) parts.push(`${cheaper.name} 价格更低`);
-  if (camera) parts.push(`${camera.name} 拍照参数更强`);
-  if (battery) parts.push(`${battery.name} 续航更占优`);
-  if (lighter) parts.push(`${lighter.name} 更轻`);
-  return parts.length ? `简要看：${parts.slice(0, 3).join("，")}。最终推荐还要结合你的预算、用途和风险偏好。` : "两款基础参数接近，最终更依赖你的预算、用途和风险偏好。";
+  const leftMeta = buildProductMetaLine(left);
+  const rightMeta = buildProductMetaLine(right);
+  const preview = [leftMeta && `${left.name}：${leftMeta}`, rightMeta && `${right.name}：${rightMeta}`].filter(Boolean);
+  return preview.length
+    ? `${preview.join("；")}。最终推荐还要结合你的预算、用途和风险偏好。`
+    : "最终推荐还要结合你的预算、用途和风险偏好。";
 }
 
 function appendUserMessage(message) {
@@ -360,16 +444,87 @@ function renderRichText(value) {
     .replaceAll("\n", "<br>");
 }
 
-function getProduct(idOrName) {
-  return productOptions.find((item) => item.id === idOrName || item.name === idOrName);
+function getSelectedProduct(input) {
+  return pickers.get(input)?.selected || null;
 }
 
-function normalize(value) {
-  return String(value).toLowerCase().replace(/\s+/g, "");
+function buildProductMetaLine(product, options = {}) {
+  return buildProductPreview(product, 3, options)
+    .map((entry) => `${entry.label}: ${entry.value}`)
+    .join(" · ");
 }
 
-function repairRiskLabel(value) {
-  return { low: "低", medium: "中", high: "高" }[value] ?? value;
+function getProductPrice(product) {
+  const data = product.data || {};
+  const raw = data.price_text || data.params?.电商报价 || "";
+  const text = String(raw).trim();
+  if (!text || /^[￥¥]?\s*0+(\.0+)?$/.test(text)) return "";
+  return /^[￥¥]/.test(text) ? text : `￥${text}`;
+}
+
+function buildProductPreview(product, limit, options = {}) {
+  const skipPrice = Boolean(options.skipPrice);
+  const entries = flattenRecord(product.data || {})
+    .filter((entry) => isUsefulPreview(entry, product.name))
+    .filter((entry) => !skipPrice || !isPriceEntry(entry))
+    .sort((a, b) => previewRank(b) - previewRank(a));
+  return entries.slice(0, limit).map((entry) => ({
+    label: prettifyLabel(entry.path),
+    value: trimText(entry.value, 42),
+  }));
+}
+
+function prettifyLabel(path) {
+  // 扁平化后的 key 形如 "params.电商报价"，展示时去掉技术前缀，只保留末段字段名。
+  return String(path).split(".").pop();
+}
+
+function isPriceEntry(entry) {
+  return /电商报价|price/i.test(entry.path) || /[￥¥]\s*\d/.test(entry.value);
+}
+
+function flattenRecord(value, prefix = "") {
+  if (Array.isArray(value)) {
+    return value.flatMap((item, index) => flattenRecord(item, `${prefix}[${index}]`));
+  }
+  if (value && typeof value === "object") {
+    return Object.entries(value).flatMap(([key, nested]) => flattenRecord(nested, prefix ? `${prefix}.${key}` : key));
+  }
+  if (value === null || value === undefined) return [];
+  return [{ path: prefix, value: String(value).trim() }];
+}
+
+// 非规格字段：爬虫元数据 + 营销标签堆，展示时会显得突兀（如 price_text、使用场景），一律排除。
+const PREVIEW_EXCLUDE_FIELDS = new Set([
+  "zol_id",
+  "title",
+  "detail_url",
+  "param_url",
+  "price_text",
+  "使用场景",
+]);
+
+function isUsefulPreview(entry, productName) {
+  if (!entry.path || !entry.value) return false;
+  if (entry.value === productName) return false;
+  if (PREVIEW_EXCLUDE_FIELDS.has(prettifyLabel(entry.path))) return false;
+  if (/^https?:\/\//i.test(entry.value)) return false;
+  return entry.value.length <= 120;
+}
+
+function previewRank(entry) {
+  const text = `${entry.path} ${entry.value}`;
+  let score = 0;
+  if (/[￥¥]\s*\d|\d+\s*元/.test(text)) score += 4;
+  if (/20\d{2}\s*年|\d+\s*月/.test(text)) score += 3;
+  if (/(gb|tb|mah|hz|克|g\b|cpu|ram|rom|ppi|英寸)/i.test(text)) score += 2;
+  if (/id|url/i.test(entry.path)) score -= 3;
+  return score;
+}
+
+function trimText(value, maxLength) {
+  const text = String(value);
+  return text.length > maxLength ? `${text.slice(0, maxLength - 1)}…` : text;
 }
 
 function autosizeTextarea() {

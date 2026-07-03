@@ -52,7 +52,7 @@ def build_recommend_agent(settings: Settings) -> Agent[RecommendDeps, AgentRespo
     ) -> dict[str, Any]:
         """联网搜索全网公开信息，获取手机的真实口碑、评测、用户反馈、维修和价格线索。
 
-        当你需要 mock 商品参数之外的真实证据时调用我。一轮可以针对不同商品或不同维度发起多个搜索。
+        当你需要 Redis 原始元信息之外的真实证据时调用我。一轮可以针对不同商品或不同维度发起多个搜索。
         返回若干条网页的标题、来源站点、摘要和链接，不是完整帖子。
         """
         ctx.deps.trace.append("called:web_search")

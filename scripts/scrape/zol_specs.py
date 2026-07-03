@@ -6,11 +6,13 @@
 数据流：
     列表页 -> 详情页链接(/cell_phone/index{ID}.shtml)
           -> 详情页提取 series id -> 参数页(/{series}/{ID}/param.shtml)
-          -> 解析 <tr><th>名</th><td>值</td> 表格 + “电商报价”
+          -> 解析 <tr><th>名</th><td>值</td> 表格
+          -> 价格取详情页 .price-type（权威），参数页「电商报价」兜底
 
 站点特征：
     - 全站 GBK 编码
     - 反爬：带 Referer 即可，无验证码（请控制频率）
+    - 价格不在参数页，而在详情页的 .price-type 价格区（纯数字）
 
 用法：
     python scripts/scrape/zol_specs.py --limit 60
@@ -44,6 +46,12 @@ HEADERS = {
 
 DETAIL_RE = re.compile(r"/cell_phone/index(\d+)\.shtml")
 SERIES_RE = re.compile(r"/(\d+)/(\d+)/param\.shtml")
+
+# 详情页价格容器：.price-type 稳定返回纯数字价格（.price 带“开售”噪音，
+# span.price 是对比串价）。参数页的「电商报价」只有部分机型有，价格真正的
+# 权威来源是详情页，因此以详情页为主、参数页为兜底。
+PRICE_SELECTOR = ".price-type"
+PRICE_RE = re.compile(r"(\d{3,7})")
 
 
 def fetch(url: str, referer: str = HOME_URL) -> str | None:
@@ -148,6 +156,22 @@ def extract_title(detail_html: str) -> str:
     return title.strip()
 
 
+def extract_price(detail_html: str, params: dict[str, str]) -> str:
+    """提取电商报价，返回 '￥6499' 形式；取不到返回空串。
+
+    价格权威来源是「详情页」的 .price-type（纯数字）；参数页的「电商报价」
+    只有部分机型有，作为兜底。个别机型详情页写「价格面议」无数字，此时也兜底
+    到参数页；都取不到就留空（绝不臆造价格）。
+    """
+    soup = BeautifulSoup(detail_html, "html.parser")
+    el = soup.select_one(PRICE_SELECTOR)
+    if el:
+        match = PRICE_RE.search(el.get_text(" ", strip=True))
+        if match:
+            return f"￥{match.group(1)}"
+    return params.get("电商报价", "")
+
+
 def scrape_one(pid: str) -> dict | None:
     detail_url = f"{BASE}/cell_phone/index{pid}.shtml"
     detail_html = fetch(detail_url)
@@ -165,12 +189,13 @@ def scrape_one(pid: str) -> dict | None:
     if not params:
         print(f"  [empty params] {pid} ({title})")
         return None
+    price_text = extract_price(detail_html, params)
     return {
         "zol_id": pid,
         "title": title,
         "detail_url": detail_url,
         "param_url": param_url,
-        "price_text": params.get("电商报价", ""),
+        "price_text": price_text,
         "params": params,
     }
 

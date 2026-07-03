@@ -4,8 +4,8 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
+from app.schemas.product_metadata import ProductRecord
 from app.schemas.long_term_memory import LongTermMemory
-from app.schemas.product import ProductSpec
 from app.schemas.recommendation import RecommendationResult
 from app.schemas.user_profile import UserProfile
 
@@ -25,7 +25,7 @@ class ChatResponse(BaseModel):
     assistant_message: str
     user_profile: UserProfile
     long_term_memory: LongTermMemory
-    products: list[ProductSpec] = Field(default_factory=list)
+    products: list[ProductRecord] = Field(default_factory=list)
     recommendation: RecommendationResult | None = None
     answer_source: str = "fallback"
     agent_trace: list[str] = Field(default_factory=list)

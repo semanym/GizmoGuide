@@ -43,13 +43,15 @@
 
             <form id="compare-form" class="compare-form" aria-label="Product comparison setup">
               <div class="product-picker">
-                <label>
+                <label class="search-picker">
                   <span>候选 A</span>
-                  <select id="product-a" name="productA" aria-label="候选商品 A"></select>
+                  <input id="product-a" name="productA" autocomplete="off" placeholder="搜索手机型号" aria-label="候选商品 A" />
+                  <div id="product-a-results" class="search-results hidden"></div>
                 </label>
-                <label>
+                <label class="search-picker">
                   <span>候选 B</span>
-                  <select id="product-b" name="productB" aria-label="候选商品 B"></select>
+                  <input id="product-b" name="productB" autocomplete="off" placeholder="搜索手机型号" aria-label="候选商品 B" />
+                  <div id="product-b-results" class="search-results hidden"></div>
                 </label>
               </div>
               <button id="compare-button" class="compare-button" type="submit">开始对比</button>

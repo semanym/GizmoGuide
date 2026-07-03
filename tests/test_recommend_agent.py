@@ -6,6 +6,7 @@ from pydantic_ai.messages import ModelMessage, ModelResponse, TextPart, ToolCall
 from app.agent.recommend_agent import RecommendDeps, build_recommend_agent
 from app.config.settings import Settings
 from app.tools.web_search_tool import WebSearchTool
+from tests.product_store_fakes import patch_product_store
 
 
 def _settings() -> Settings:
@@ -54,12 +55,12 @@ def test_agent_calls_web_search_then_answers():
             return ModelResponse(
                 parts=[ToolCallPart(tool_name="web_search", args={"query": "iPhone 15 续航 小红书", "count": 3})]
             )
-        return ModelResponse(parts=[TextPart(content="综合小红书反馈，iPhone 15 日常续航够用。")])
+        return ModelResponse(parts=[TextPart(content='{"reply":"综合小红书反馈，iPhone 15 日常续航够用。"}')])
 
     with agent.override(model=FunctionModel(model_fn)):
         result = agent.run_sync("帮我对比 iPhone 15 和 vivo X100，主要看续航", deps=deps)
 
-    assert "续航" in result.output
+    assert "续航" in result.output.reply
     assert "called:web_search" in deps.trace
     assert captured["query"] == "iPhone 15 续航 小红书"
     assert captured["count"] == 3
@@ -73,12 +74,12 @@ def test_agent_can_answer_without_tool():
     deps = _deps_with_stub(settings, captured)
 
     def model_fn(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
-        return ModelResponse(parts=[TextPart(content="你先告诉我预算大概多少？")])
+        return ModelResponse(parts=[TextPart(content='{"reply":"你先告诉我预算大概多少？"}')])
 
     with agent.override(model=FunctionModel(model_fn)):
         result = agent.run_sync("帮我看看", deps=deps)
 
-    assert "预算" in result.output
+    assert "预算" in result.output.reply
     assert "called:web_search" not in deps.trace
     assert captured == {}
 
@@ -96,11 +97,13 @@ def test_agent_finishes_gracefully_on_round_limit(monkeypatch):
     import app.agent.purchase_agent as pa
     import app.agent.recommend_agent as ra
     from pydantic_ai import Agent
+    from app.agent.schemas import AgentResponse
     from app.agent.purchase_agent import PurchaseDecisionAgent
     from app.schemas.chat import ChatRequest
 
     settings = _settings()
     monkeypatch.setattr(pa, "get_settings", lambda: settings)
+    patch_product_store(monkeypatch)
 
     # 推荐 agent 的底层模型每轮都要求搜索，必然触顶 request_limit。
     def always_search(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
@@ -113,8 +116,9 @@ def test_agent_finishes_gracefully_on_round_limit(monkeypatch):
     def stub_finisher(_settings_arg):
         return Agent(
             FunctionModel(
-                lambda messages, info: ModelResponse(parts=[TextPart(content="基于已查到的信息：推荐 vivo X100。")])
-            )
+                lambda messages, info: ModelResponse(parts=[TextPart(content='{"reply":"基于已查到的信息：推荐 vivo X100。"}')])
+            ),
+            output_type=AgentResponse,
         )
 
     monkeypatch.setattr(pa, "build_finisher_agent", stub_finisher)
