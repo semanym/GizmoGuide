@@ -6,9 +6,10 @@ from typing import Any
 
 import jieba
 
+from app.embedding.client import EmbeddingClient
+from app.knowledge.debug import debug_chunks
 from app.knowledge.models import RetrievedChunk
 from app.knowledge.store import KnowledgeStore
-from app.embedding.client import EmbeddingClient
 from app.tracing import trace_span
 
 logger = logging.getLogger(__name__)
@@ -72,6 +73,26 @@ def dual_recall(
                 "bm25_count": len(bm25_results),
                 "vector_count": len(vector_results),
                 "tokenized_query": tokenized_query,
+                "bm25_results": [
+                    {
+                        "rank": item.rank,
+                        "chunk_id": item.chunk_id,
+                        "title": item.title,
+                        "score": item.score,
+                        "source": item.source,
+                    }
+                    for item in debug_chunks(bm25_results, limit=10)
+                ],
+                "vector_results": [
+                    {
+                        "rank": item.rank,
+                        "chunk_id": item.chunk_id,
+                        "title": item.title,
+                        "score": item.score,
+                        "source": item.source,
+                    }
+                    for item in debug_chunks(vector_results, limit=10)
+                ],
             },
             metadata_extra={
                 "bm25_top_ids": [r.chunk_id for r in bm25_results[:3]],
