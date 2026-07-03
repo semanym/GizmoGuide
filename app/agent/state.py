@@ -7,7 +7,7 @@ from typing import Any, Protocol
 
 from app.config.settings import Settings, get_settings
 from app.schemas.long_term_memory import LongTermMemory
-from app.schemas.product import ProductSpec
+from app.schemas.product_metadata import ProductRecord
 from app.schemas.user_profile import UserProfile
 
 logger = logging.getLogger(__name__)
@@ -17,7 +17,7 @@ logger = logging.getLogger(__name__)
 class ConversationState:
     session_id: str
     user_id: str | None = None
-    candidate_products: list[ProductSpec] = field(default_factory=list)
+    candidate_product_records: list[ProductRecord] = field(default_factory=list)
     profile: UserProfile = field(default_factory=UserProfile)
     messages: list[dict[str, str]] = field(default_factory=list)
     agent_messages: list[Any] = field(default_factory=list)
@@ -50,7 +50,6 @@ class InMemorySessionStore(SessionStore):
 
     def save(self, state: ConversationState) -> None:
         self._sessions[state.session_id] = state
-
 
 class InMemoryLongTermMemoryStore(LongTermMemoryStore):
     def __init__(self) -> None:
@@ -145,7 +144,7 @@ def _encode_conversation_state(state: ConversationState) -> str:
     payload = {
         "session_id": state.session_id,
         "user_id": state.user_id,
-        "candidate_products": [product.model_dump(mode="json") for product in state.candidate_products],
+        "candidate_product_records": [product.model_dump(mode="json") for product in state.candidate_product_records],
         "profile": state.profile.model_dump(mode="json"),
         "messages": state.messages[-40:],
     }
@@ -157,7 +156,7 @@ def _decode_conversation_state(raw: str) -> ConversationState:
     return ConversationState(
         session_id=payload["session_id"],
         user_id=payload.get("user_id"),
-        candidate_products=[ProductSpec.model_validate(item) for item in payload.get("candidate_products", [])],
+        candidate_product_records=[ProductRecord.model_validate(item) for item in payload.get("candidate_product_records", [])],
         profile=UserProfile.model_validate(payload.get("profile") or {}),
         messages=list(payload.get("messages") or []),
     )

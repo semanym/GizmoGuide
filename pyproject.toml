@@ -9,6 +9,7 @@ dependencies = [
     "pydantic>=2.8",
     "pydantic-ai-slim[openai]>=2.0",
     "certifi>=2024.0",
+    "redis>=5.0",
 ]
 
 [project.optional-dependencies]

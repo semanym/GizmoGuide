@@ -31,6 +31,13 @@ class Settings:
     redis_url: str | None = None
     session_ttl_seconds: int = 86400
     long_term_memory_ttl_seconds: int = 15552000
+    # Product metadata store
+    product_redis_url: str = "redis://localhost:6379/1"
+    product_metadata_dataset_path: str = "scripts/data/zol_specs_raw.json"
+    product_search_default_limit: int = 20
+    # 规则打分护栏开关：开启时把 ZOL 参数按规则算出的确定性对比分作为锚点塞进上下文；
+    # 关闭则完全不调用打分引擎，上下文里不带 scoring_guardrail_result。默认关闭。
+    scoring_enabled: bool = False
 
     @property
     def llm_enabled(self) -> bool:
@@ -47,6 +54,14 @@ class Settings:
     @property
     def rag_enabled(self) -> bool:
         return bool(self.dashscope_api_key and self.rag_database_url)
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    """从环境变量读布尔开关；未设置时用默认值。接受 1/true/yes/on（大小写不敏感）。"""
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
 def load_dotenv(path: Path | None = None) -> None:
@@ -88,4 +103,8 @@ def get_settings() -> Settings:
         redis_url=os.getenv("REDIS_URL"),
         session_ttl_seconds=int(os.getenv("SESSION_TTL_SECONDS", "86400")),
         long_term_memory_ttl_seconds=int(os.getenv("LONG_TERM_MEMORY_TTL_SECONDS", "15552000")),
+        product_redis_url=os.getenv("PRODUCT_REDIS_URL", "redis://localhost:6379/1"),
+        product_metadata_dataset_path=os.getenv("PRODUCT_METADATA_DATASET_PATH", "scripts/data/zol_specs_raw.json"),
+        product_search_default_limit=int(os.getenv("PRODUCT_SEARCH_DEFAULT_LIMIT", "20")),
+        scoring_enabled=_env_bool("SCORING_ENABLED", False),
     )

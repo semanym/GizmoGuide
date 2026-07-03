@@ -9,19 +9,20 @@ from pydantic_ai.exceptions import UsageLimitExceeded
 from pydantic_ai.usage import UsageLimits
 
 from app.agent.llm_client import ChatMessage, DeepSeekClient
-from app.agent.prompts import AGENT_SYSTEM_PROMPT
+from app.agent.prompts import AGENT_SYSTEM_PROMPT, SCORING_GUARDRAIL_HINT
 from app.agent.recommend_agent import RecommendDeps, build_finisher_agent, build_recommend_agent
 from app.agent.schemas import AgentResponse
 from app.agent.state import ConversationState, long_term_memory_store, session_store
 from app.config.settings import get_settings
+from app.decision.spec_scoring import build_product_specs
 from app.orchestrator.long_term_memory_extractor import merge_profiles
 from app.schemas.chat import ChatRequest, ChatResponse
 from app.schemas.long_term_memory import LongTermMemory
 from app.schemas.recommendation import RecommendationRequest, RecommendationResponse, RecommendationResult
 from app.tools.memory_fork_tool import MemoryForkTool
 from app.tools.product_tool import ProductTool
-from app.tools.scoring_tool import ScoringTool
 from app.tools.knowledge_search_tool import KnowledgeSearchTool
+from app.tools.scoring_tool import ScoringTool
 from app.tools.web_search_tool import WebSearchTool
 from app.tracing import trace_span, trace_generation
 
@@ -86,14 +87,19 @@ class PurchaseDecisionAgent:
             self._emit(emit, "memory", "长期记忆已更新", {"user_id": user_id})
             state.messages.append({"role": "user", "content": request.message})
 
-            self._emit(emit, "scoring", "正在结合画像和候选商品做基础评分", {"candidate_count": len(state.candidate_products)})
-            scoring_result = self._try_scoring(state)
-            self._emit(
-                emit,
-                "scoring",
-                "基础评分完成" if scoring_result else "当前信息不足，暂不输出评分结论",
-                {"winner": scoring_result.winner_name if scoring_result else None},
-            )
+            # 规则打分护栏：把 ZOL 原始参数按规则算出确定性对比分，作为大模型的参考锚点。
+            # 由 settings.scoring_enabled 控制；关闭时整段评分（含前端进度事件）都不触发。
+            if self.settings.scoring_enabled:
+                self._emit(emit, "scoring", "正在结合画像和候选商品做基础评分", {"candidate_count": len(state.candidate_product_records)})
+                scoring_result = self._try_scoring(state)
+                self._emit(
+                    emit,
+                    "scoring",
+                    "基础评分完成" if scoring_result else "当前信息不足，暂不输出评分结论",
+                    {"winner": scoring_result.winner_name if scoring_result else None},
+                )
+            else:
+                scoring_result = None
 
             if self.llm_client.enabled and (self.web_search_tool.enabled or self.knowledge_search_tool.enabled):
                 try:
@@ -199,21 +205,37 @@ class PurchaseDecisionAgent:
         with trace_span("product_lookup", input_data={"candidates": candidate_products}) as (span, end_span):
             products, missing = self.product_tool.get_products(candidate_products)
             if products:
-                state.candidate_products = products
+                state.candidate_product_records = products
             end_span(output={"found": len(products), "missing": missing})
             return len(products), missing
 
     def _try_scoring(self, state: ConversationState) -> RecommendationResult | None:
-        if len(state.candidate_products) < 2:
+        """规则打分护栏：ZOL 原始参数 -> ProductSpec -> 确定性对比结果。
+
+        大模型有最终解释权，判断以商品原始元信息为主，这个结果只作为次要参考塞进上下文；
+        由 settings.scoring_enabled 开关控制：关闭时完全不调用打分引擎，直接返回 None，
+        上下文里不会带 scoring_guardrail_result。候选不足两款或数据算不出来时也安静返回
+        None，不打断主流程。
+        """
+        if not self.settings.scoring_enabled:
             return None
-        with trace_span("scoring_engine", input_data={"products": [p.name for p in state.candidate_products]}) as (span, end_span):
-            try:
-                result = self.scoring_tool.evaluate(state.candidate_products, state.profile)
-                end_span(output={"winner": result.winner_name, "confidence": result.confidence})
-                return result
-            except Exception as exc:
-                end_span(level="ERROR", output={"error": str(exc)})
-                return None
+        if len(state.candidate_product_records) < 2:
+            return None
+        try:
+            specs = build_product_specs(state.candidate_product_records)
+            return self.scoring_tool.evaluate(specs, state.profile)
+        except Exception:
+            return None
+
+    def _system_prompt_with_scoring_hint(
+        self, scoring_result: RecommendationResult | None
+    ) -> str:
+        """只有真的带了打分结果时，才把「次要参考」提示拼到 system prompt 后面；
+        开关关闭或算不出分数时，上下文里没有 scoring_guardrail_result，也就不提它。
+        """
+        if scoring_result is None:
+            return AGENT_SYSTEM_PROMPT
+        return f"{AGENT_SYSTEM_PROMPT}\n\n{SCORING_GUARDRAIL_HINT}"
 
     def _agent_loop_chat(
         self,
@@ -230,7 +252,7 @@ class PurchaseDecisionAgent:
             memory = self._get_long_term_memory(state)
 
             context_payload = {
-                "candidate_products": [product.model_dump(mode="json") for product in state.candidate_products],
+                "candidate_product_metadata": self._candidate_metadata_payload(state),
                 "user_profile": state.profile.model_dump(mode="json"),
                 "long_term_memory": memory.model_dump(mode="json"),
                 "scoring_guardrail_result": scoring_result.model_dump(mode="json") if scoring_result else None,
@@ -246,7 +268,7 @@ class PurchaseDecisionAgent:
             # request_limit 作为护栏：限制模型的请求轮数（一轮里并行调多个工具只算 1 次），
             # +1 是留给「拿到搜索结果后生成最终回答」的那一次请求，防止死循环/烧钱。
             round_limit = max(1, self.settings.agent_max_tool_rounds)
-            trace = ["used_agent", "used_product_tool", "used_scoring_guardrail_tool"]
+            trace = ["used_agent", "used_product_tool", "used_product_metadata"]
 
             with capture_run_messages() as run_messages:
                 with trace_generation(
@@ -290,64 +312,43 @@ class PurchaseDecisionAgent:
             trace.extend(deps.trace)
             final_text = (agent_output.reply or "").strip() or "我需要再了解一点你的购买需求。"
 
-            # Use structured output to override scoring result if agent made a decision
-            effective_scoring = scoring_result
-            if agent_output.winner_id and agent_output.confidence > 0:
-                effective_scoring = self._merge_agent_decision(scoring_result, agent_output, state)
+            recommendation = self._recommendation_from_agent(agent_output, scoring_result)
 
             end_agent_span(output={
-                "mode": "recommendation" if effective_scoring is not None else "chat",
+                "mode": "recommendation" if recommendation is not None else "chat",
                 "agent_confidence": agent_output.confidence,
                 "agent_winner": agent_output.winner_name,
             })
             return ChatResponse(
                 session_id=state.session_id,
                 user_id=memory.user_id,
-                mode="recommendation" if effective_scoring is not None else "chat",
+                mode="recommendation" if recommendation is not None else "chat",
                 assistant_message=final_text,
                 user_profile=state.profile,
                 long_term_memory=memory,
-                products=state.candidate_products,
-                recommendation=effective_scoring,
+                products=state.candidate_product_records,
+                recommendation=recommendation,
                 answer_source="agent",
                 agent_trace=trace,
             )
 
-    def _merge_agent_decision(
+    def _recommendation_from_agent(
         self,
-        scoring_result: RecommendationResult | None,
         agent_output: AgentResponse,
-        state: ConversationState,
+        scoring_result: RecommendationResult | None,
     ) -> RecommendationResult | None:
-        """Merge the agent's structured decision into the scoring result.
-
-        If a scoring result exists, overlay the agent's winner/confidence/reasons.
-        If no scoring result exists, synthesize one from the agent's decision.
-        """
-        if scoring_result is not None:
-            # Overlay agent's judgment onto existing scoring
-            score_by_id = {s.product_id: s for s in scoring_result.scores}
-            winner_id = agent_output.winner_id if agent_output.winner_id in score_by_id else scoring_result.winner_id
-            winner_name = score_by_id.get(winner_id, scoring_result.scores[0] if scoring_result.scores else None)
-            return RecommendationResult(
-                winner_id=winner_id,
-                winner_name=winner_name.product_name if hasattr(winner_name, "product_name") else str(winner_name),
-                confidence=max(0.0, min(1.0, agent_output.confidence or scoring_result.confidence)),
-                scores=scoring_result.scores,
-                key_reasons=agent_output.key_reasons or scoring_result.key_reasons,
-                risks=agent_output.risks or scoring_result.risks,
-                reversal_conditions=scoring_result.reversal_conditions,
-                missing_information=agent_output.missing_information or scoring_result.missing_information,
-            )
-        # No scoring result (e.g. < 2 candidates) — synthesize minimal result
+        if not agent_output.winner_id and not agent_output.winner_name:
+            return None
+        if agent_output.confidence <= 0:
+            return None
         return RecommendationResult(
             winner_id=agent_output.winner_id or "",
             winner_name=agent_output.winner_name or "",
             confidence=agent_output.confidence,
-            scores=[],
+            scores=scoring_result.scores if scoring_result else [],
             key_reasons=agent_output.key_reasons,
             risks=agent_output.risks,
-            reversal_conditions=[],
+            reversal_conditions=scoring_result.reversal_conditions if scoring_result else [],
             missing_information=agent_output.missing_information,
         )
 
@@ -377,11 +378,11 @@ class PurchaseDecisionAgent:
             payload = {
                 "current_user_message": request.message,
                 "conversation_history": state.messages[-8:],
-                "candidate_products": [product.model_dump(mode="json") for product in state.candidate_products],
+                "candidate_product_metadata": self._candidate_metadata_payload(state),
                 "user_profile": state.profile.model_dump(mode="json"),
                 "scoring_guardrail_result": scoring_result.model_dump(mode="json") if scoring_result else None,
                 "tooling_status": {
-                    "product_tool": "available_mock_data",
+                    "product_tool": "available_redis_zol_metadata",
                     "scoring_guardrail_tool": "available_reference_only",
                     "web_search_tool": "not_implemented_yet",
                     "local_kb_rag_tool": "not_implemented_yet",
@@ -389,15 +390,13 @@ class PurchaseDecisionAgent:
             }
             data = self.llm_client.chat_json(
                 [
-                    ChatMessage(role="system", content=AGENT_SYSTEM_PROMPT),
+                    ChatMessage(role="system", content=self._system_prompt_with_scoring_hint(scoring_result)),
                     ChatMessage(role="user", content=json.dumps(payload, ensure_ascii=False)),
                 ],
                 temperature=0.3,
             )
             mode = "recommendation" if data.get("mode") == "recommendation" else "chat"
-            recommendation = None
-            if mode == "recommendation" and scoring_result is not None:
-                recommendation = self._recommendation_from_llm(data, scoring_result)
+            recommendation = self._recommendation_from_llm(data, scoring_result) if mode == "recommendation" else None
 
             end_span(output={"mode": mode, "answer_source": "llm"})
             return ChatResponse(
@@ -407,26 +406,39 @@ class PurchaseDecisionAgent:
                 assistant_message=str(data.get("assistant_message") or data.get("summary") or "我需要再了解一点你的购买需求。"),
                 user_profile=state.profile,
                 long_term_memory=self._get_long_term_memory(state),
-                products=state.candidate_products,
+                products=state.candidate_product_records,
                 recommendation=recommendation,
                 answer_source="llm",
-                agent_trace=["used_agent", "used_product_tool", "used_scoring_guardrail_tool", "used_deepseek"],
+                agent_trace=["used_agent", "used_product_tool", "used_product_metadata", "used_scoring_guardrail_tool", "used_deepseek"],
             )
 
-    def _recommendation_from_llm(self, data: dict[str, Any], fallback: RecommendationResult) -> RecommendationResult:
-        score_by_id = {score.product_id: score for score in fallback.scores}
-        winner_id = data.get("winner_id") if data.get("winner_id") in score_by_id else fallback.winner_id
-        winner_name = score_by_id[winner_id].product_name
-        confidence = data.get("confidence", fallback.confidence)
+    def _candidate_metadata_payload(self, state: ConversationState) -> list[dict[str, Any]]:
+        payload: list[dict[str, Any]] = []
+        for item in state.candidate_product_records:
+            payload.append(item.data)
+        return payload
+
+    def _recommendation_from_llm(
+        self,
+        data: dict[str, Any],
+        scoring_result: RecommendationResult | None,
+    ) -> RecommendationResult | None:
+        winner_id = str(data.get("winner_id") or "")
+        winner_name = str(data.get("winner_name") or "")
+        if not winner_id and not winner_name:
+            return None
+        confidence = data.get("confidence", 0)
+        scores = scoring_result.scores if scoring_result else []
+        guardrail_reversals = scoring_result.reversal_conditions if scoring_result else []
         return RecommendationResult(
             winner_id=winner_id,
             winner_name=winner_name,
             confidence=max(0.0, min(1.0, float(confidence))),
-            scores=fallback.scores,
-            key_reasons=list(data.get("key_reasons") or fallback.key_reasons),
-            risks=list(data.get("risks") or fallback.risks),
-            reversal_conditions=list(data.get("reversal_conditions") or fallback.reversal_conditions),
-            missing_information=list(data.get("missing_information") or fallback.missing_information),
+            scores=scores,
+            key_reasons=list(data.get("key_reasons") or []),
+            risks=list(data.get("risks") or []),
+            reversal_conditions=list(data.get("reversal_conditions") or guardrail_reversals),
+            missing_information=list(data.get("missing_information") or []),
         )
 
     def _fallback_chat(
@@ -436,11 +448,12 @@ class PurchaseDecisionAgent:
         scoring_result: RecommendationResult | None,
     ) -> ChatResponse:
         with trace_span("fallback_chat") as (span, end_span):
-            if len(state.candidate_products) < 2:
+            if len(state.candidate_product_records) < 2:
                 message = "你先选两款想比较的商品，我会先帮你做基础对比，然后继续聊你的预算和用途。"
                 mode = "chat"
                 recommendation = None
             elif scoring_result and self._profile_has_enough_signal(state):
+                # 大模型不可用时，用规则打分护栏的确定性结果兜底给出对比结论。
                 message = self._fallback_recommendation_message(scoring_result)
                 mode = "recommendation"
                 recommendation = scoring_result
@@ -457,10 +470,10 @@ class PurchaseDecisionAgent:
                 assistant_message=message,
                 user_profile=state.profile,
                 long_term_memory=self._get_long_term_memory(state),
-                products=state.candidate_products,
+                products=state.candidate_product_records,
                 recommendation=recommendation,
                 answer_source="fallback",
-                agent_trace=["used_agent", "used_product_tool", "used_scoring_guardrail_tool", "llm_disabled"],
+                agent_trace=["used_agent", "used_product_tool", "used_product_metadata", "used_scoring_guardrail_tool", "llm_disabled"],
             )
 
     def _memory_user_id(self, state: ConversationState) -> str:
@@ -473,20 +486,20 @@ class PurchaseDecisionAgent:
         profile = state.profile
         return bool(profile.budget and profile.primary_scenarios)
 
-    def _next_natural_question(self, state: ConversationState) -> str:
-        profile = state.profile
-        names = " 和 ".join(product.name for product in state.candidate_products[:2])
-        if not profile.budget:
-            return f"这两款 {names} 我已经有基础参数了。你大概预算上限是多少？我会结合价格压力来判断。"
-        if not profile.primary_scenarios:
-            return f"预算我记下了。你主要拿它做什么？比如拍照、游戏、日常、办公，或者给长辈用。"
-        return "我还想确认一个关键点：你更担心价格、维修风险、续航，还是拍照/性能体验？"
-
     def _fallback_recommendation_message(self, result: RecommendationResult) -> str:
         lines = [f"综合你目前说的信息，我更倾向推荐 {result.winner_name}。"]
         if result.key_reasons:
             lines.append("主要原因是：" + "；".join(result.key_reasons[:3]))
         if result.risks:
             lines.append("需要注意：" + "；".join(result.risks[:2]))
-        lines.append("后面接入联网搜索和本地维修知识库后，我可以把评测、口碑和维修风险也纳入判断。")
+        lines.append("开启大模型并接入联网搜索后，我可以把评测、口碑和维修风险也纳入判断。")
         return "\n".join(lines)
+
+    def _next_natural_question(self, state: ConversationState) -> str:
+        profile = state.profile
+        names = " 和 ".join(product.name for product in state.candidate_product_records[:2])
+        if not profile.budget:
+            return f"这两款 {names} 我已经从 ZOL 元信息库读取到原始参数了。你大概预算上限是多少？"
+        if not profile.primary_scenarios:
+            return f"预算我记下了。你主要拿它做什么？比如拍照、游戏、日常、办公，或者给长辈用。"
+        return "我还想确认一个关键点：你更担心价格、维修风险、续航，还是拍照/性能体验？开启大模型后我会基于原始参数和联网证据给结论。"

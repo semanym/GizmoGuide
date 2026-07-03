@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pydantic import BaseModel, Field
 
-from app.schemas.product import ProductSpec
+from app.schemas.product_metadata import ProductRecord
 from app.schemas.user_profile import UserProfile
 
 
@@ -26,7 +26,7 @@ class RecommendationResult(BaseModel):
     winner_id: str
     winner_name: str
     confidence: float = Field(ge=0, le=1)
-    scores: list[ProductScore]
+    scores: list[ProductScore] = Field(default_factory=list)
     key_reasons: list[str]
     risks: list[str]
     reversal_conditions: list[str]
@@ -42,7 +42,7 @@ class RecommendationResponse(BaseModel):
     need_clarification: bool
     clarification_questions: list[ClarificationQuestion] = Field(default_factory=list)
     user_profile: UserProfile
-    products: list[ProductSpec] = Field(default_factory=list)
+    products: list[ProductRecord] = Field(default_factory=list)
     recommendation: RecommendationResult | None = None
     answer: str | None = None
     answer_source: str = "fallback"
