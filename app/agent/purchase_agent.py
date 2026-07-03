@@ -9,7 +9,7 @@ from pydantic_ai.exceptions import UsageLimitExceeded
 from pydantic_ai.usage import UsageLimits
 
 from app.agent.llm_client import ChatMessage, DeepSeekClient
-from app.agent.prompts import AGENT_SYSTEM_PROMPT
+from app.agent.prompts import AGENT_SYSTEM_PROMPT, SCORING_GUARDRAIL_HINT
 from app.agent.recommend_agent import RecommendDeps, build_finisher_agent, build_recommend_agent
 from app.agent.schemas import AgentResponse
 from app.agent.state import ConversationState, long_term_memory_store, session_store
@@ -212,7 +212,7 @@ class PurchaseDecisionAgent:
     def _try_scoring(self, state: ConversationState) -> RecommendationResult | None:
         """规则打分护栏：ZOL 原始参数 -> ProductSpec -> 确定性对比结果。
 
-        大模型有最终解释权，这个结果只作为参考锚点塞进上下文，防止模型跑偏；
+        大模型有最终解释权，判断以商品原始元信息为主，这个结果只作为次要参考塞进上下文；
         由 settings.scoring_enabled 开关控制：关闭时完全不调用打分引擎，直接返回 None，
         上下文里不会带 scoring_guardrail_result。候选不足两款或数据算不出来时也安静返回
         None，不打断主流程。
@@ -226,6 +226,16 @@ class PurchaseDecisionAgent:
             return self.scoring_tool.evaluate(specs, state.profile)
         except Exception:
             return None
+
+    def _system_prompt_with_scoring_hint(
+        self, scoring_result: RecommendationResult | None
+    ) -> str:
+        """只有真的带了打分结果时，才把「次要参考」提示拼到 system prompt 后面；
+        开关关闭或算不出分数时，上下文里没有 scoring_guardrail_result，也就不提它。
+        """
+        if scoring_result is None:
+            return AGENT_SYSTEM_PROMPT
+        return f"{AGENT_SYSTEM_PROMPT}\n\n{SCORING_GUARDRAIL_HINT}"
 
     def _agent_loop_chat(
         self,
@@ -380,7 +390,7 @@ class PurchaseDecisionAgent:
             }
             data = self.llm_client.chat_json(
                 [
-                    ChatMessage(role="system", content=AGENT_SYSTEM_PROMPT),
+                    ChatMessage(role="system", content=self._system_prompt_with_scoring_hint(scoring_result)),
                     ChatMessage(role="user", content=json.dumps(payload, ensure_ascii=False)),
                 ],
                 temperature=0.3,

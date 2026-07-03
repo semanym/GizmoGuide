@@ -8,7 +8,7 @@ from pydantic_ai import Agent, RunContext
 from pydantic_ai.models.openai import OpenAIChatModel
 from pydantic_ai.providers.openai import OpenAIProvider
 
-from app.agent.prompts import AGENT_TOOL_SYSTEM_PROMPT
+from app.agent.prompts import AGENT_TOOL_SYSTEM_PROMPT, SCORING_GUARDRAIL_HINT
 from app.agent.schemas import AgentResponse
 from app.config.settings import Settings
 from app.tools.knowledge_search_tool import KnowledgeSearchTool
@@ -31,11 +31,16 @@ def build_recommend_agent(settings: Settings) -> Agent[RecommendDeps, AgentRespo
     handled by pydantic-ai; we only declare the tool and inject dependencies.
     Returns structured AgentResponse instead of raw str.
     """
+    system_prompt = AGENT_TOOL_SYSTEM_PROMPT
+    # 打分开关打开时，才把「辅助参考」提示拼进 system prompt；关闭时上下文里根本没有
+    # scoring_guardrail_result，也就不提它。
+    if settings.scoring_enabled:
+        system_prompt = f"{system_prompt}\n\n{SCORING_GUARDRAIL_HINT}"
     agent = Agent(
         _build_model(settings),
         deps_type=RecommendDeps,
         output_type=AgentResponse,
-        system_prompt=AGENT_TOOL_SYSTEM_PROMPT,
+        system_prompt=system_prompt,
     )
 
     @agent.tool
@@ -52,7 +57,7 @@ def build_recommend_agent(settings: Settings) -> Agent[RecommendDeps, AgentRespo
     ) -> dict[str, Any]:
         """联网搜索全网公开信息，获取手机的真实口碑、评测、用户反馈、维修和价格线索。
 
-        当你需要 Redis 原始元信息之外的真实证据时调用我。一轮可以针对不同商品或不同维度发起多个搜索。
+        当你需要商品原始元信息之外的真实证据时调用我。一轮可以针对不同商品或不同维度发起多个搜索。
         返回若干条网页的标题、来源站点、摘要和链接，不是完整帖子。
         """
         ctx.deps.trace.append("called:web_search")
