@@ -27,6 +27,9 @@ class Settings:
     rag_database_url: str = "postgresql://langfuse:langfuse@postgres:5432/langfuse"
     rag_recall_top_k: int = 10
     rag_rerank_top_n: int = 5
+    # 知识库语料与离线预算的 embedding 缓存路径（相对项目根，或绝对路径）
+    knowledge_corpus_dir: str = "scripts/data/knowledge"
+    knowledge_embeddings_path: str = "scripts/data/knowledge_embeddings.json"
     # Session / long-term memory
     redis_url: str | None = None
     session_ttl_seconds: int = 86400
@@ -100,6 +103,8 @@ def get_settings() -> Settings:
         rag_database_url=os.getenv("RAG_DATABASE_URL", "postgresql://langfuse:langfuse@postgres:5432/langfuse"),
         rag_recall_top_k=int(os.getenv("RAG_RECALL_TOP_K", "10")),
         rag_rerank_top_n=int(os.getenv("RAG_RERANK_TOP_N", "5")),
+        knowledge_corpus_dir=os.getenv("KNOWLEDGE_CORPUS_DIR", "scripts/data/knowledge"),
+        knowledge_embeddings_path=os.getenv("KNOWLEDGE_EMBEDDINGS_PATH", "scripts/data/knowledge_embeddings.json"),
         redis_url=os.getenv("REDIS_URL"),
         session_ttl_seconds=int(os.getenv("SESSION_TTL_SECONDS", "86400")),
         long_term_memory_ttl_seconds=int(os.getenv("LONG_TERM_MEMORY_TTL_SECONDS", "15552000")),

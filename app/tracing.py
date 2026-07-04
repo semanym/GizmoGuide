@@ -1,10 +1,17 @@
-"""Langfuse v4 tracing integration for GizmoGuide.
+"""Tracing for GizmoGuide with a local fallback.
 
-Uses the Langfuse Python SDK v4 which is built on OpenTelemetry.
-Nested observations automatically inherit parent context via OTel.
-When Langfuse is not configured all operations become silent no-ops.
+Three backends, picked once at first use:
 
-Usage:
+* ``off``      – ``DISABLE_TRACING`` is truthy → every helper is a no-op.
+* ``langfuse`` – Langfuse keys are set *and* the Langfuse host is reachable →
+  observations are reported to Langfuse (v4 SDK, OpenTelemetry based).
+* ``file``     – Langfuse is unavailable → the same span/generation tree is
+  written to a local JSONL file (one line per root request). This is the
+  fallback so tracing still works (and stops spamming an unreachable Langfuse)
+  when the Langfuse stack isn't running.
+
+The public API is unchanged:
+
     from app.tracing import trace_request, trace_span, trace_generation
 
     with trace_request(session_id, user_id) as obs:
@@ -19,48 +26,222 @@ Usage:
 
 from __future__ import annotations
 
+import contextvars
+import json
 import logging
+import os
+import socket
+import threading
+import time
 from contextlib import contextmanager
+from pathlib import Path
 from typing import Any, Optional
+from urllib.parse import urlparse
 
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Lazy client initialisation
+# Backend selection (lazy, once)
 # ---------------------------------------------------------------------------
 
+_TRACE_OFF = "off"
+_TRACE_LANGFUSE = "langfuse"
+_TRACE_FILE = "file"
+
+_mode: Optional[str] = None
 _client: Any = None
-_client_initialised = False
+_trace_path: Optional[Path] = None
+_write_lock = threading.Lock()
+_initialised = False
+
+# Current span for the file backend; enables parent/child nesting across the
+# `with` blocks (Langfuse does this itself via OTel context).
+_current_span: contextvars.ContextVar[Optional["_LocalSpan"]] = contextvars.ContextVar(
+    "gizmoguide_current_span", default=None
+)
 
 
-def _init_client() -> Any:
-    """Initialise the Langfuse v4 client once, reading env vars automatically."""
-    global _client, _client_initialised
+def _truthy(value: Optional[str]) -> bool:
+    return (value or "").strip().lower() in {"1", "true", "yes", "on"}
 
-    if _client_initialised:
-        return _client
 
-    _client_initialised = True
-
+def _host_reachable(url: str, timeout: float = 0.3) -> bool:
+    """Quick TCP probe so we don't hand spans to an unreachable Langfuse."""
+    parsed = urlparse(url if "://" in url else f"http://{url}")
+    host = parsed.hostname or "localhost"
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
     try:
-        from langfuse import Langfuse
-    except ImportError:
-        logger.debug("langfuse package not installed; tracing disabled")
-        return None
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
 
+
+def _init() -> None:
+    global _mode, _client, _trace_path, _initialised
+    if _initialised:
+        return
+    _initialised = True
+
+    if _truthy(os.getenv("DISABLE_TRACING")):
+        _mode = _TRACE_OFF
+        logger.info("Tracing disabled (DISABLE_TRACING set)")
+        return
+
+    public_key = os.getenv("LANGFUSE_PUBLIC_KEY")
+    secret_key = os.getenv("LANGFUSE_SECRET_KEY")
+    host = os.getenv("LANGFUSE_HOST", "http://localhost:3000")
+
+    if public_key and secret_key:
+        if _host_reachable(host):
+            try:
+                from langfuse import Langfuse
+
+                _client = Langfuse()
+                _mode = _TRACE_LANGFUSE
+                logger.info("Tracing backend: Langfuse (%s)", host)
+                return
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Langfuse init failed, using local file tracing: %s", exc)
+        else:
+            logger.warning(
+                "Langfuse host %s unreachable, using local file tracing instead", host
+            )
+
+    _mode = _TRACE_FILE
+    _trace_path = Path(os.getenv("TRACE_FILE_PATH", "log/trace.jsonl"))
     try:
-        _client = Langfuse()
-        logger.info("Langfuse v4 tracing initialised successfully")
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("Failed to initialise Langfuse: %s", exc)
-        _client = None
-
-    return _client
+        _trace_path.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        logger.warning("Cannot create trace dir %s, tracing off: %s", _trace_path.parent, exc)
+        _mode = _TRACE_OFF
+        return
+    logger.info("Tracing backend: local file (%s)", _trace_path)
 
 
 def _get_client() -> Any:
-    """Return the shared Langfuse client or *None* if unavailable."""
-    return _init_client()
+    """Return the Langfuse client if that backend is active, else None."""
+    _init()
+    return _client if _mode == _TRACE_LANGFUSE else None
+
+
+# ---------------------------------------------------------------------------
+# Local file backend
+# ---------------------------------------------------------------------------
+
+
+class _LocalSpan:
+    """A minimal observation node for the file backend."""
+
+    def __init__(
+        self,
+        name: str,
+        as_type: str,
+        input_data: Any = None,
+        metadata: Optional[dict] = None,
+        model: Optional[str] = None,
+    ):
+        self.name = name
+        self.as_type = as_type
+        self.input = input_data
+        self.metadata = dict(metadata) if metadata else None
+        self.model = model
+        self.output: Any = None
+        self.level = "DEFAULT"
+        self.status_message: Optional[str] = None
+        self.usage: Optional[dict] = None
+        self.start = time.time()
+        self.end: Optional[float] = None
+        self.children: list["_LocalSpan"] = []
+
+    def update(
+        self,
+        output: Any = None,
+        metadata: Optional[dict] = None,
+        level: Optional[str] = None,
+        status_message: Optional[str] = None,
+        usage_details: Optional[dict] = None,
+        **_ignored: Any,
+    ) -> None:
+        """Mirror the subset of Langfuse's ``update`` the callers rely on."""
+        if output is not None:
+            self.output = output
+        if metadata:
+            self.metadata = {**(self.metadata or {}), **metadata}
+        if level is not None:
+            self.level = level
+        if status_message is not None:
+            self.status_message = status_message
+        if usage_details:
+            self.usage = usage_details
+
+    def to_dict(self) -> dict[str, Any]:
+        data: dict[str, Any] = {
+            "name": self.name,
+            "type": self.as_type,
+            "duration_ms": round((self.end or time.time()) - self.start, 4) * 1000
+            if self.end
+            else None,
+            "level": self.level,
+        }
+        if self.model:
+            data["model"] = self.model
+        if self.input is not None:
+            data["input"] = self.input
+        if self.output is not None:
+            data["output"] = self.output
+        if self.metadata:
+            data["metadata"] = self.metadata
+        if self.usage:
+            data["usage"] = self.usage
+        if self.status_message:
+            data["status_message"] = self.status_message
+        if self.children:
+            data["children"] = [c.to_dict() for c in self.children]
+        return data
+
+
+def _write_trace(root: _LocalSpan) -> None:
+    if _trace_path is None:
+        return
+    line = json.dumps(
+        {"ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "trace": root.to_dict()},
+        ensure_ascii=False,
+        default=str,
+    )
+    try:
+        with _write_lock:
+            with open(_trace_path, "a", encoding="utf-8") as f:
+                f.write(line + "\n")
+    except OSError:  # noqa: BLE001
+        logger.debug("Failed to write trace to %s", _trace_path, exc_info=True)
+
+
+@contextmanager
+def _local_observation(
+    name: str,
+    as_type: str,
+    input_data: Any = None,
+    metadata: Optional[dict] = None,
+    model: Optional[str] = None,
+):
+    """Open a local span, wire it under the current parent, write on root exit."""
+    span = _LocalSpan(name, as_type, input_data, metadata, model)
+    parent = _current_span.get()
+    if parent is not None:
+        parent.children.append(span)
+    token = _current_span.set(span)
+    try:
+        yield span
+    except Exception as exc:  # noqa: BLE001
+        span.level = "ERROR"
+        span.status_message = str(exc)
+        raise
+    finally:
+        span.end = time.time()
+        _current_span.reset(token)
+        if parent is None:
+            _write_trace(span)
 
 
 # ---------------------------------------------------------------------------
@@ -78,10 +259,9 @@ def trace_request(
     """Create a root observation for a single API request.
 
     Yields the observation object (or *None* when tracing is off).
-    Session and user info are stored in observation metadata.
     """
-    client = _get_client()
-    if client is None:
+    _init()
+    if _mode == _TRACE_OFF:
         yield None
         return
 
@@ -89,6 +269,12 @@ def trace_request(
     if metadata:
         meta.update(metadata)
 
+    if _mode == _TRACE_FILE:
+        with _local_observation("gizmoguide_request", "span", input_data, meta) as span:
+            yield span
+        return
+
+    client = _client
     with client.start_as_current_observation(
         name="gizmoguide_request",
         as_type="span",
@@ -117,15 +303,26 @@ def trace_span(
     """Open a child span under the active observation.
 
     Yields ``(span, end_span)`` where ``end_span(output=...)`` records output.
-    No-op when tracing client is unavailable.
-    OTel context propagation handles parent nesting automatically.
     """
-    client = _get_client()
-    if client is None:
+    _init()
+    if _mode == _TRACE_OFF:
         yield None, lambda **kw: None
         return
 
-    with client.start_as_current_observation(
+    if _mode == _TRACE_FILE:
+        with _local_observation(name, "span", input_data, metadata) as span:
+
+            def end_span(
+                output: Any = None,
+                metadata_extra: Optional[dict] = None,
+                level: str = "DEFAULT",
+            ):
+                span.update(output=output, metadata=metadata_extra, level=level)
+
+            yield span, end_span
+        return
+
+    with _client.start_as_current_observation(
         name=name,
         as_type="span",
         input=input_data,
@@ -181,9 +378,29 @@ def trace_generation(
     Yields ``(generation, end_generation)`` where
     ``end_generation(output=..., usage_details={...})`` records the result.
     """
-    client = _get_client()
-    if client is None:
+    _init()
+    if _mode == _TRACE_OFF:
         yield None, lambda **kw: None
+        return
+
+    if _mode == _TRACE_FILE:
+        with _local_observation(name, "generation", input_data, metadata, model=model) as gen:
+
+            def end_generation(
+                output: Any = None,
+                usage: Optional[dict] = None,
+                usage_details: Optional[dict] = None,
+                metadata_extra: Optional[dict] = None,
+                level: str = "DEFAULT",
+            ):
+                gen.update(
+                    output=output,
+                    metadata=metadata_extra,
+                    level=level,
+                    usage_details=usage_details or usage,
+                )
+
+            yield gen, end_generation
         return
 
     kwargs: dict[str, Any] = {
@@ -195,7 +412,7 @@ def trace_generation(
     if model:
         kwargs["model"] = model
 
-    with client.start_as_current_observation(**kwargs) as gen:
+    with _client.start_as_current_observation(**kwargs) as gen:
         ended = False
 
         def end_generation(

@@ -29,8 +29,12 @@ def main() -> None:
     store.ensure_schema()
 
     print("==> Generating embeddings and seeding knowledge...")
-    embedder = EmbeddingClient(settings.dashscope_api_key)
-    count = seed_knowledge(store, embedder)
+    embedder = EmbeddingClient(
+        settings.dashscope_api_key,
+        model=settings.dashscope_embedding_model,
+        dimensions=settings.embedding_dimensions,
+    )
+    count = seed_knowledge(store, embedder, settings)
 
     print(f"==> Done. {count} chunks seeded. Total: {store.count()}")
 

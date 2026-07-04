@@ -37,16 +37,34 @@ def _seed_product_metadata() -> None:
 
 @app.on_event("startup")
 def _ensure_rag_schema() -> None:
-    """Create knowledge_base table if it doesn't exist (idempotent)."""
+    """Ensure the knowledge_base schema exists and seed it once if empty.
+
+    Seeding is offline: vectors come from the committed embedding cache, so a
+    fully-built cache means no embedding API calls at startup. Failures here are
+    non-fatal — the app still serves without RAG.
+    """
     try:
         settings = get_settings()
-        if settings.rag_enabled:
-            from app.knowledge.store import KnowledgeStore
-            store = KnowledgeStore(settings.rag_database_url)
-            store.ensure_schema()
-            logger.info("RAG schema ensured")
+        if not settings.rag_enabled:
+            return
+        from app.embedding.client import EmbeddingClient
+        from app.knowledge.seed import seed_knowledge
+        from app.knowledge.store import KnowledgeStore
+
+        store = KnowledgeStore(settings.rag_database_url)
+        store.ensure_schema()
+        logger.info("RAG schema ensured")
+
+        embedder = EmbeddingClient(
+            settings.dashscope_api_key,
+            model=settings.dashscope_embedding_model,
+            dimensions=settings.embedding_dimensions,
+        )
+        seeded = seed_knowledge(store, embedder, settings)
+        if seeded:
+            logger.info("Knowledge base seeded with %d chunks", seeded)
     except Exception as exc:
-        logger.warning("RAG schema init skipped: %s", exc)
+        logger.warning("RAG init skipped: %s", exc)
 
 
 @app.get("/health")
