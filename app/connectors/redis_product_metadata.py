@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from functools import lru_cache
 from pathlib import Path
@@ -21,12 +22,22 @@ class RedisProductMetadataStore:
         self.key_prefix = "product:metadata"
         self.name_index_key = f"{self.key_prefix}:names"
         self.alias_index_key = f"{self.key_prefix}:aliases"
+        self.fingerprint_key = f"{self.key_prefix}:fingerprint"
 
     def ensure_seeded(self) -> int:
+        """按数据集指纹幂等灌库：指纹未变且库非空则跳过，变化或空库则清空重灌。
+
+        指纹是数据集文件内容的 sha256，任何内容变化（记录数、字段值）都会触发重灌，
+        保证 Redis 与数据集文件严格一致；文件没变时重启秒过，不做无谓写入。
+        """
         self.redis.ping()
         if not self.dataset_path.exists():
             raise FileNotFoundError(f"Product metadata dataset not found: {self.dataset_path}")
-        raw_items = json.loads(self.dataset_path.read_text(encoding="utf-8"))
+        raw_bytes = self.dataset_path.read_bytes()
+        fingerprint = hashlib.sha256(raw_bytes).hexdigest()
+        if self._is_up_to_date(fingerprint):
+            return self._seeded_count()
+        raw_items = json.loads(raw_bytes.decode("utf-8"))
         self._clear_existing()
         pipe = self.redis.pipeline(transaction=False)
         seeded_names: set[str] = set()
@@ -38,7 +49,17 @@ class RedisProductMetadataStore:
                 pipe.hset(self.alias_index_key, alias, record.name)
             seeded_names.add(record.name)
         pipe.execute()
+        self.redis.set(self.fingerprint_key, fingerprint)
         return len(seeded_names)
+
+    def _is_up_to_date(self, fingerprint: str) -> bool:
+        """指纹匹配且 name 索引非空时，视为已是最新，可跳过重灌。"""
+        if self.redis.get(self.fingerprint_key) != fingerprint:
+            return False
+        return self.redis.scard(self.name_index_key) > 0
+
+    def _seeded_count(self) -> int:
+        return self.redis.scard(self.name_index_key)
 
     def _clear_existing(self) -> None:
         existing_names = list(self.redis.smembers(self.name_index_key))

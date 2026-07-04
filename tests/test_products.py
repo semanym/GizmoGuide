@@ -56,6 +56,10 @@ class FakeRedis:
     def ping(self):
         return True
 
+    def set(self, key, value):
+        self.data[key] = value
+        return True
+
     def scard(self, key):
         return len(self.sets.get(key, set()))
 
@@ -163,3 +167,48 @@ def test_redis_product_metadata_seed_search_and_lookup(tmp_path, monkeypatch):
     assert missing == []
     assert [item.name for item in metadata] == ["小米14", "vivo X100"]
     assert [item.data["zol_id"] for item in metadata] == ["1", "2"]
+
+
+def _write_dataset(path: Path, items: list[dict]) -> None:
+    path.write_text(json.dumps(items, ensure_ascii=False), encoding="utf-8")
+
+
+def test_ensure_seeded_is_fingerprint_idempotent(tmp_path, monkeypatch):
+    dataset = tmp_path / "zol_specs.json"
+    _write_dataset(dataset, [{"zol_id": "1", "title": "小米14", "params": {}}])
+
+    fake_redis = FakeRedis()
+    monkeypatch.setattr("app.connectors.redis_product_metadata.Redis.from_url", lambda *a, **k: fake_redis)
+    store = RedisProductMetadataStore(_settings(dataset))
+
+    assert store.ensure_seeded() == 1
+    fingerprint_after_first = fake_redis.data[store.fingerprint_key]
+
+    # 数据集未变：第二次调用应跳过重灌（不改动库、指纹不变），仍返回真实条数。
+    monkeypatch.setattr(
+        store, "_clear_existing",
+        lambda: (_ for _ in ()).throw(AssertionError("unchanged dataset must not trigger reseed")),
+    )
+    assert store.ensure_seeded() == 1
+    assert fake_redis.data[store.fingerprint_key] == fingerprint_after_first
+
+
+def test_ensure_seeded_reseeds_when_dataset_changes(tmp_path, monkeypatch):
+    dataset = tmp_path / "zol_specs.json"
+    _write_dataset(dataset, [{"zol_id": "1", "title": "小米14", "params": {}}])
+
+    fake_redis = FakeRedis()
+    monkeypatch.setattr("app.connectors.redis_product_metadata.Redis.from_url", lambda *a, **k: fake_redis)
+    store = RedisProductMetadataStore(_settings(dataset))
+
+    assert store.ensure_seeded() == 1
+    first_fingerprint = fake_redis.data[store.fingerprint_key]
+
+    # 数据集内容变化：指纹改变，触发重灌，新记录生效、旧记录被清掉。
+    _write_dataset(dataset, [
+        {"zol_id": "1", "title": "小米14", "params": {}},
+        {"zol_id": "2", "title": "vivo X100", "params": {}},
+    ])
+    assert store.ensure_seeded() == 2
+    assert fake_redis.data[store.fingerprint_key] != first_fingerprint
+    assert {item.name for item in store.search("", limit=10)} == {"小米14", "vivo X100"}
